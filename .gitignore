@@ -1,0 +1,9 @@
+# personal data: settings, sheet state, printed labels
+config.json
+state.json
+output/
+*.pdf
+__pycache__/
+*.pyc
+
+!examples/*.pdf
