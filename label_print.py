@@ -16,7 +16,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 import pymupdf
-from PIL import Image, ImageTk, ImageWin
+from PIL import Image, ImageGrab, ImageTk, ImageWin
 import win32con
 import win32gui
 import win32print
@@ -34,9 +34,12 @@ A4_W, A4_H = 210.0, 297.0
 COLS, ROWS = 2, 2
 CELL_W, CELL_H = A4_W / COLS, A4_H / ROWS     # 105 x 148.5 mm
 PAD_MM = 1.5                                   # margin around detected content
+FIT_MM = 5.0                                   # margin inside the cell when a label is enlarged
 PV_W = 380                                     # preview width, px
 PAPER = {"A4": (9, A4_W, A4_H), "A6": (70, 105.0, 148.0)}   # DMPAPER code, width, height (mm)
 ARROW_BOX = (102.5, 238.0, 5.0, 50.0)          # mm: x, y, w, h — gap between columns, bottom of sheet
+IMG_EXT = (".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp", ".tif", ".tiff")
+FILETYPES = [("PDF / images", "*.pdf " + " ".join("*" + e for e in IMG_EXT)), ("PDF", "*.pdf")]
 FONT = "C:/Windows/Fonts/arial.ttf"            # Cyrillic-capable font for printed hints
 
 # ---------- translations ----------
@@ -61,6 +64,25 @@ T = {
         "arrow_chk": "Стрелка «в лоток» на новом листе A4",
         "print": "ПЕЧАТЬ",
         "print_all": "ПЕЧАТЬ ВСЕХ ({n}) НА ЛИСТ",
+        "add": "Добавить PDF в очередь…",
+        "paste": "Вставить скрин из буфера (Ctrl+V)",
+        "no_clip_t": "Буфер обмена",
+        "no_clip": "В буфере обмена нет изображения",
+        "crop": "Выбрать область…",
+        "crop_t": "Область печати",
+        "crop_hint": "Обведите мышью нужную область этикетки",
+        "crop_queue": "Нажмите на этикетку в предпросмотре листа — откроется выбор области",
+        "ok": "Готово",
+        "auto": "Авто (вся этикетка)",
+        "cancel": "Отмена",
+        "cropped": " (своя область)",
+        "rotate90": "Повернуть на 90°",
+        "rot_lbl": "Поворот: {r}",
+        "rot_auto": "авто",
+        "fit": "Растянуть на всю ячейку",
+        "result": "Так будет напечатано:",
+        "clear": "Очистить очередь",
+        "queued": "в очереди: {n}",
         "batch_more": "Свободных мест: {f}, этикеток: {n}. Напечатаются первые {f}.",
         "batch_t": "Пакетная печать",
         "language": "Язык:",
@@ -105,6 +127,25 @@ T = {
         "arrow_chk": "“Feed edge” arrow on a new A4 sheet",
         "print": "PRINT",
         "print_all": "PRINT ALL ({n}) ON SHEET",
+        "add": "Add PDF to queue…",
+        "paste": "Paste screenshot (Ctrl+V)",
+        "no_clip_t": "Clipboard",
+        "no_clip": "No image in the clipboard",
+        "crop": "Select area…",
+        "crop_t": "Print area",
+        "crop_hint": "Drag the mouse around the label area",
+        "crop_queue": "Click a label on the sheet preview to select its area",
+        "ok": "Done",
+        "auto": "Auto (whole label)",
+        "cancel": "Cancel",
+        "cropped": " (custom area)",
+        "rotate90": "Rotate 90°",
+        "rot_lbl": "Rotation: {r}",
+        "rot_auto": "auto",
+        "fit": "Fill the whole cell",
+        "result": "This is what will print:",
+        "clear": "Clear queue",
+        "queued": "queued: {n}",
         "batch_more": "Free slots: {f}, labels: {n}. The first {f} will be printed.",
         "batch_t": "Batch print",
         "language": "Language:",
@@ -132,6 +173,15 @@ T = {
     },
 }
 LANGS = {"ru": "Русский", "en": "English"}
+
+
+def open_source(path):
+    """PDF as is; an image is converted into a one-page PDF."""
+    path = Path(path)
+    if path.suffix.lower() in IMG_EXT:
+        img = pymupdf.open(path)
+        return pymupdf.open("pdf", img.convert_to_pdf())
+    return pymupdf.open(path)
 
 
 def default_lang():
@@ -209,14 +259,17 @@ def text_rotation(page, clip):
     return best
 
 
-def build_page(src_page, pos, cfg, rot_override=None, lang="en", out=None):
+def build_page(src_page, pos, cfg, rot_override=None, lang="en", out=None, clip=None, fit=False):
     """Returns (single-page doc of the paper size with the label in cell pos, info)."""
     mode = cfg.get("mode", "A4")
-    clip = content_bbox(src_page)
+    clip = content_bbox(src_page) if clip is None else clip
     rot = text_rotation(src_page, clip) if rot_override is None else rot_override
     w, h = (clip.height, clip.width) if rot in (90, 270) else (clip.width, clip.height)
     cx, cy, cw, ch = page_cell(pos, mode)
-    scale = min(1.0, cw * MM / w, ch * MM / h)
+    if fit:   # enlarge (or shrink) to the cell minus a margin the printer can reach
+        scale = min((cw - 2 * FIT_MM) * MM / w, (ch - 2 * FIT_MM) * MM / h)
+    else:
+        scale = min(1.0, cw * MM / w, ch * MM / h)
     if scale < 1.0 and not cfg.get("allow_shrink", True):
         raise ValueError(T[lang]["too_big"])
     tw, th = w * scale, h * scale
@@ -335,8 +388,13 @@ class App:
         self.rot_override = None
         self.preview_img = None
         self.main = None
-        self.batch = []          # [(pymupdf doc, page_no, name)] — all labels opened
+        self.batch = []          # [(pymupdf doc, page_no, path str)] — all labels opened
+        self.crops = {}          # (path str, page_no) -> pymupdf.Rect chosen by hand
+        self.rots = {}           # (path str, page_no) -> rotation chosen by hand
+        self.fits = {}           # (path str, page_no) -> enlarge to the whole cell
         root.resizable(False, False)
+        root.bind_all("<Control-v>", lambda e: self.paste_clipboard())
+        root.bind_all("<Control-V>", lambda e: self.paste_clipboard())
         self.build_ui()
         if initial:
             self.load(Path(initial))
@@ -391,6 +449,7 @@ class App:
         self.new_btn = ttk.Button(side, text=t["new_sheet"], command=self.new_sheet)
         self.new_btn.pack(fill="x", pady=(8, 2))
         ttk.Button(side, text=t["flip"], command=self.flip).pack(fill="x", pady=2)
+        ttk.Button(side, text=t["crop"], command=self.crop_current).pack(fill="x", pady=2)
 
         ttk.Separator(side).pack(fill="x", pady=8)
         ttk.Label(side, text=t["printer"]).pack(anchor="w")
@@ -416,6 +475,12 @@ class App:
         self.info = ttk.Label(side, text="", wraplength=210, justify="left")
         self.info.pack(anchor="w")
         ttk.Button(side, text=t["print"], command=self.do_print).pack(fill="x", pady=(10, 0), ipady=8)
+        ttk.Separator(side).pack(fill="x", pady=8)
+        ttk.Button(side, text=t["paste"], command=self.paste_clipboard).pack(fill="x", pady=(0, 4))
+        qf = ttk.Frame(side)
+        qf.pack(fill="x")
+        ttk.Button(qf, text=t["add"], command=self.add_dialog).pack(side="left", fill="x", expand=True)
+        ttk.Button(qf, text=t["clear"], command=self.clear_queue).pack(side="left", padx=(4, 0))
         self.all_btn = ttk.Button(side, command=self.print_all)
         self.all_btn.pack(fill="x", pady=(6, 0), ipady=6)
         self.on_mode()
@@ -442,14 +507,15 @@ class App:
     def flip(self):
         if self.src is None:
             return
-        self.rot_override = (self.current_rot() + 180) % 360
+        self.rots[(str(self.src_path), self.page_no)] = (self.current_rot() + 180) % 360
         self.redraw()
 
     def current_rot(self):
-        if self.rot_override is not None:
-            return self.rot_override
+        r = self.rots.get((str(self.src_path), self.page_no))
+        if r is not None:
+            return r
         pg = self.src[self.page_no]
-        return text_rotation(pg, content_bbox(pg))
+        return text_rotation(pg, self.clip_for(str(self.src_path), self.page_no) or content_bbox(pg))
 
     def arrow_due(self):
         """The arrow is printed once: in A4 mode, on a fresh sheet (no slot used yet)."""
@@ -463,8 +529,182 @@ class App:
         self.update_batch_btn()
         self.redraw()
 
+    def queue_preview(self):
+        return self.cfg.get("mode") == "A4" and len(self.batch) > 1
+
+    def add_dialog(self):
+        self.add_files(filedialog.askopenfilenames(initialdir=DOWNLOADS, filetypes=FILETYPES))
+
+    def add_files(self, fs):
+        for f in fs:
+            try:
+                d = open_source(f)
+            except Exception as e:
+                messagebox.showerror(self.t["error"], self.t["open_err"].format(e=e))
+                continue
+            if self.src is None:
+                self.load(Path(f))
+                self.batch = []
+            self.batch += [(d, i, str(Path(f))) for i in range(len(d))]
+        self.update_batch_btn()
+        self.redraw()
+
+    def paste_clipboard(self):
+        """Screenshot (or copied image files) from the clipboard -> load or add to the queue."""
+        try:
+            clip = ImageGrab.grabclipboard()
+        except Exception:
+            clip = None
+        if isinstance(clip, list):
+            files = [f for f in clip if Path(f).suffix.lower() in (".pdf",) + IMG_EXT]
+        elif isinstance(clip, Image.Image):
+            OUT.mkdir(exist_ok=True)
+            f = OUT / f"clip-{time.strftime('%Y%m%d-%H%M%S')}.png"
+            clip.convert("RGB").save(f)
+            files = [str(f)]
+        else:
+            files = []
+        if not files:
+            messagebox.showinfo(self.t["no_clip_t"], self.t["no_clip"])
+            return
+        self.add_files(files)
+
+    def clip_for(self, key, pn):
+        return self.crops.get((key, pn))
+
+    def fit_for(self, key, pn):
+        """Hand-cropped labels are enlarged to the cell unless switched off."""
+        return self.fits.get((key, pn), (key, pn) in self.crops)
+
+    def free_slots(self):
+        return [p for p in range(1, 5) if p not in self.state["used"]] or [1, 2, 3, 4]
+
+    def crop_current(self):
+        if self.queue_preview():
+            messagebox.showinfo(self.t["crop_t"], self.t["crop_queue"])
+            return
+        if self.src is None:
+            messagebox.showinfo(self.t["nofile_t"], self.t["nofile"])
+            return
+        self.crop_dialog(self.src, self.page_no, str(self.src_path))
+
+    def crop_dialog(self, doc, pn, key):
+        """Whole source page on the left (drag = area to print), live result on the right."""
+        t = self.t
+        page = doc[pn]
+        z = min(760 / page.rect.width, 640 / page.rect.height)
+        pix = page.get_pixmap(matrix=pymupdf.Matrix(z, z), alpha=False)
+        img = ImageTk.PhotoImage(Image.frombytes("RGB", (pix.width, pix.height), pix.samples))
+        win = tk.Toplevel(self.root)
+        win.title(f"{t['crop_t']} — {Path(key).name}")
+        win.transient(self.root)
+        win.resizable(False, False)
+        body = ttk.Frame(win, padding=6)
+        body.pack()
+        left, right = ttk.Frame(body), ttk.Frame(body)
+        left.grid(row=0, column=0, sticky="n")
+        right.grid(row=0, column=1, sticky="n", padx=(10, 0))
+        ttk.Label(left, text=t["crop_hint"]).pack(anchor="w", pady=(0, 2))
+        cv = tk.Canvas(left, width=pix.width, height=pix.height, cursor="crosshair",
+                       highlightthickness=1, highlightbackground="#888")
+        cv.pack()
+        cv.create_image(0, 0, anchor="nw", image=img)
+        cv.img = img
+        cur = self.clip_for(key, pn) or content_bbox(page)
+        sel = {"r": [cur.x0 * z, cur.y0 * z, cur.x1 * z, cur.y1 * z]}
+        rid = cv.create_rectangle(*sel["r"], outline="#d22", width=2, dash=(5, 3))
+
+        # result preview: one A6-sized cell, the same geometry as on paper
+        rw = 280
+        rh = round(rw * PAPER["A6"][2] / PAPER["A6"][1])
+        ttk.Label(right, text=t["result"]).pack(anchor="w", pady=(0, 2))
+        rv_cv = tk.Canvas(right, width=rw, height=rh, bg="white",
+                          highlightthickness=1, highlightbackground="#888")
+        rv_cv.pack()
+        rot = {"v": self.rots.get((key, pn))}
+        rot_var = tk.StringVar()
+        fit_var = tk.BooleanVar(value=self.fits.get((key, pn), True))
+        info_var = tk.StringVar()
+
+        def sel_rect():
+            x0, y0, x1, y1 = sel["r"]
+            r = pymupdf.Rect(min(x0, x1) / z, min(y0, y1) / z, max(x0, x1) / z, max(y0, y1) / z)
+            return r & page.rect if r.width > 10 and r.height > 10 else None
+
+        def render():
+            r = sel_rect()
+            try:
+                cfg = dict(self.cfg, mode="A6")
+                built, inf = build_page(page, 1, cfg, rot["v"], self.cfg["lang"],
+                                        clip=r, fit=fit_var.get() if r is not None else False)
+            except Exception as e:
+                info_var.set(f"{t['error']}: {e}")
+                return
+            zz = rw / (PAPER["A6"][1] * MM)
+            px = built[0].get_pixmap(matrix=pymupdf.Matrix(zz, zz), alpha=False)
+            rv_cv.img = ImageTk.PhotoImage(Image.frombytes("RGB", (px.width, px.height), px.samples))
+            rv_cv.delete("all")
+            rv_cv.create_image(0, 0, anchor="nw", image=rv_cv.img)
+            k = rw / PAPER["A6"][1]
+            rv_cv.create_rectangle(FIT_MM * k, FIT_MM * k, rw - FIT_MM * k, rh - FIT_MM * k,
+                                   outline="#bbb", dash=(2, 3))
+            auto = t["rot_auto"] + f" ({inf['rot']}°)"
+            rot_var.set(t["rot_lbl"].format(r=auto if rot["v"] is None else f"{rot['v']}°"))
+            info_var.set(f"{inf['w_mm']:.0f}×{inf['h_mm']:.0f} мм, {inf['scale'] * 100:.0f}%")
+            rot["shown"] = inf["rot"]
+
+        def rotate90():
+            base = rot["v"] if rot["v"] is not None else rot.get("shown", 0)
+            rot["v"] = (base + 90) % 360
+            render()
+
+        def press(ev):
+            sel["r"] = [ev.x, ev.y, ev.x, ev.y]
+            cv.coords(rid, *sel["r"])
+
+        def drag(ev):
+            sel["r"][2] = min(max(ev.x, 0), pix.width)
+            sel["r"][3] = min(max(ev.y, 0), pix.height)
+            cv.coords(rid, *sel["r"])
+
+        def done(rect, rv, fit):
+            for store, val in ((self.crops, rect), (self.rots, rv), (self.fits, fit)):
+                if val is None:
+                    store.pop((key, pn), None)
+                else:
+                    store[(key, pn)] = val
+            win.destroy()
+            self.redraw()
+
+        def ok():
+            r = sel_rect()
+            done(r, rot["v"], bool(fit_var.get()) if r is not None else None)
+
+        cv.bind("<ButtonPress-1>", press)
+        cv.bind("<B1-Motion>", drag)
+        cv.bind("<ButtonRelease-1>", lambda e: render())
+        ttk.Label(right, textvariable=info_var).pack(anchor="w", pady=(4, 0))
+        ttk.Checkbutton(right, text=t["fit"], variable=fit_var, command=render).pack(anchor="w", pady=(6, 0))
+        ttk.Button(right, text=t["rotate90"], command=rotate90).pack(fill="x", pady=(6, 0))
+        ttk.Label(right, textvariable=rot_var).pack(anchor="w", pady=(2, 0))
+        ttk.Separator(right).pack(fill="x", pady=8)
+        ttk.Button(right, text=t["ok"], command=ok).pack(fill="x", ipady=4)
+        ttk.Button(right, text=t["auto"], command=lambda: done(None, None, None)).pack(fill="x", pady=(6, 0))
+        ttk.Button(right, text=t["cancel"], command=win.destroy).pack(fill="x", pady=(6, 0))
+        win.bind("<Return>", lambda e: ok())
+        win.bind("<Escape>", lambda e: win.destroy())
+        render()
+        win.grab_set()
+
+    def clear_queue(self):
+        self.batch = []
+        self.update_batch_btn()
+        self.redraw()
+
     def update_batch_btn(self):
         n = len(self.batch)
+        self.file_lbl.config(text=(self.src_path.name[:28] if self.src_path else self.t["no_file"])
+                             + (f"  ({self.t['queued'].format(n=n)})" if n > 1 else ""))
         self.all_btn.config(text=self.t["print_all"].format(n=n),
                             state="normal" if n > 1 and self.cfg.get("mode") == "A4" else "disabled")
 
@@ -473,12 +713,19 @@ class App:
             return
         col = 0 if ev.x < PV_W / 2 else 1
         row = 0 if ev.y < PV_W * A4_H / A4_W / 2 else 1
+        if self.queue_preview():
+            free = self.free_slots()
+            pos = row * 2 + col + 1
+            if pos in free and free.index(pos) < len(self.batch):
+                d, pn, key = self.batch[free.index(pos)]
+                self.crop_dialog(d, pn, key)
+            return
         self.pos.set(row * 2 + col + 1)
         self.redraw()
 
     # --- loading
     def open_dialog(self):
-        fs = filedialog.askopenfilenames(initialdir=DOWNLOADS, filetypes=[("PDF", "*.pdf")])
+        fs = filedialog.askopenfilenames(initialdir=DOWNLOADS, filetypes=FILETYPES)
         if not fs:
             return
         self.load(Path(fs[0]))
@@ -486,17 +733,17 @@ class App:
             batch = []
             for f in fs:
                 try:
-                    d = pymupdf.open(f)
+                    d = open_source(f)
                 except Exception as e:
                     messagebox.showerror(self.t["error"], self.t["open_err"].format(e=e))
                     continue
-                batch += [(d, i, Path(f).name) for i in range(len(d))]
+                batch += [(d, i, str(Path(f))) for i in range(len(d))]
             self.batch = batch
-            self.file_lbl.config(text=f"{len(fs)} PDF")
             self.update_batch_btn()
 
     def open_latest(self):
-        pdfs = sorted(DOWNLOADS.glob("*.pdf"), key=lambda p: p.stat().st_mtime, reverse=True)
+        pdfs = sorted((p for p in DOWNLOADS.iterdir() if p.suffix.lower() in (".pdf",) + IMG_EXT),
+                      key=lambda p: p.stat().st_mtime, reverse=True)
         if not pdfs:
             messagebox.showinfo(self.t["no_pdfs_t"], self.t["no_pdfs"])
             return
@@ -504,7 +751,7 @@ class App:
 
     def load(self, path):
         try:
-            self.src = pymupdf.open(path)
+            self.src = open_source(path)
         except Exception as e:
             messagebox.showerror(self.t["error"], self.t["open_err"].format(e=e))
             return
@@ -512,7 +759,7 @@ class App:
         self.page_no = 0
         self.rot_override = None
         self.file_lbl.config(text=path.name[:45])
-        self.batch = [(self.src, i, path.name) for i in range(len(self.src))]
+        self.batch = [(self.src, i, str(path)) for i in range(len(self.src))]
         self.update_batch_btn()
         self.redraw()
 
@@ -524,8 +771,18 @@ class App:
         k = PV_W / A4_W
         if self.src is not None:
             try:
-                built, inf = build_page(self.src[self.page_no], self.pos.get(), self.cfg,
-                                        self.rot_override, self.cfg["lang"])
+                if self.queue_preview():
+                    built = pymupdf.open()
+                    built.new_page(width=A4_W * MM, height=A4_H * MM)
+                    for pos, (d, pn, key) in zip(self.free_slots(), self.batch):
+                        build_page(d[pn], pos, self.cfg, self.rots.get((key, pn)), self.cfg["lang"], out=built,
+                                   clip=self.clip_for(key, pn), fit=self.fit_for(key, pn))
+                    inf = {"w_mm": 0, "h_mm": 0, "scale": 1, "rot": 0}
+                else:
+                    built, inf = build_page(self.src[self.page_no], self.pos.get(), self.cfg,
+                                            self.rots.get((str(self.src_path), self.page_no)), self.cfg["lang"],
+                                            clip=self.clip_for(str(self.src_path), self.page_no),
+                                            fit=self.fit_for(str(self.src_path), self.page_no))
                 if self.arrow_due():
                     draw_feed_arrow(built[0], self.cfg["lang"])
                 z = PV_W / (PAPER[self.cfg["mode"]][1] * MM)
@@ -534,8 +791,12 @@ class App:
                 self.preview_img = ImageTk.PhotoImage(img)
                 c.create_image(0, 0, anchor="nw", image=self.preview_img)
                 pages = t["page"].format(n=self.page_no + 1, t=len(self.src)) if len(self.src) > 1 else ""
-                self.info.config(text=t["info"].format(w=inf["w_mm"], h=inf["h_mm"],
-                                                       s=inf["scale"] * 100, r=inf["rot"]) + pages)
+                if self.queue_preview():
+                    self.info.config(text=t["queued"].format(n=len(self.batch)))
+                else:
+                    own = t["cropped"] if self.clip_for(str(self.src_path), self.page_no) else ""
+                    self.info.config(text=t["info"].format(w=inf["w_mm"], h=inf["h_mm"],
+                                                           s=inf["scale"] * 100, r=inf["rot"]) + pages + own)
             except Exception as e:
                 self.info.config(text=f"{t['error']}: {e}")
         if self.cfg.get("mode") == "A6":
@@ -550,7 +811,7 @@ class App:
                 c.create_text((r[0] + r[2]) / 2, (r[1] + r[3]) / 2, text=t["used"], fill="#555",
                               font=("Segoe UI", 12))
             c.create_rectangle(*r, outline="#999", dash=(3, 3))
-            if p == self.pos.get():
+            if p == self.pos.get() and not self.queue_preview():
                 c.create_rectangle(r[0] + 2, r[1] + 2, r[2] - 2, r[3] - 2, outline="#d22", width=3)
 
     # --- printing
@@ -588,8 +849,9 @@ class App:
         try:
             doc = pymupdf.open()
             doc.new_page(width=A4_W * MM, height=A4_H * MM)
-            for pos, (d, pn, _) in items:
-                build_page(d[pn], pos, self.cfg, None, self.cfg["lang"], out=doc)
+            for pos, (d, pn, key) in items:
+                build_page(d[pn], pos, self.cfg, self.rots.get((key, pn)), self.cfg["lang"], out=doc,
+                           clip=self.clip_for(key, pn), fit=self.fit_for(key, pn))
             regions = [page_cell(pos, "A4") for pos, _ in items]
             if self.arrow_due():
                 draw_feed_arrow(doc[0], self.cfg["lang"])
@@ -624,7 +886,10 @@ class App:
                 t["busy_t"], t["busy"].format(p=pos)):
             return
         try:
-            doc, _ = build_page(self.src[self.page_no], pos, self.cfg, self.rot_override, self.cfg["lang"])
+            doc, _ = build_page(self.src[self.page_no], pos, self.cfg,
+                                self.rots.get((str(self.src_path), self.page_no)), self.cfg["lang"],
+                                clip=self.clip_for(str(self.src_path), self.page_no),
+                                fit=self.fit_for(str(self.src_path), self.page_no))
             regions = [page_cell(pos, self.cfg["mode"])]
             if self.arrow_due():
                 draw_feed_arrow(doc[0], self.cfg["lang"])

@@ -15,8 +15,11 @@ Courier services (Orlen Paczka, DPD, InPost, DHL, GLS, Vinted shipping…) usual
 
 ## Features
 
-- Auto-detects the label area on the page (no manual cropping)
-- Auto-rotates by text direction, plus a one-click 180° flip
+- Auto-detects the label area on the page
+- Manual crop when auto-detection is not enough (e.g. a return label with an order summary below it): drag a rectangle over the page and see the printed result live next to it. A hand-cropped area can be enlarged to fill the whole cell.
+- Auto-rotates by text direction, plus a 180° flip and 90° steps per label (for labels that are a picture with no text to read the direction from)
+- Opens images too (PNG, JPG, BMP, WEBP, GIF, TIFF), and pastes a screenshot straight from the clipboard with Ctrl+V
+- Batch printing on A4: open or add several labels to a queue, preview the whole sheet and print them all into the free slots in one job. Click a label on the sheet preview to crop or rotate it.
 - Prints 1:1 through Windows GDI. No "fit to page" scaling, no PDF viewer involved.
 - Live preview of the sheet with used and free slots
 - Remembers used slots on the A4 sheet. A one-time "feed this edge first" arrow on a new sheet shows how to put it back in the tray.
@@ -80,7 +83,7 @@ Settings live in `config.json` and the sheet state in `state.json`, next to the 
 - **Режим A6**: лист A4 заранее режется на 4 части (105 × 148 мм), каждая этикетка печатается по центру куска.
 - **Режим A4**: целый лист (обычный или с 4 наклейками A6), печать в позицию 1–4. Занятые места программа запоминает.
 
-Возможности: автоопределение и автоповорот этикетки, предпросмотр, печать 1:1 без масштабирования, калибровка со сдвигом X/Y в мм, кнопка «Последний PDF из Загрузок», перетаскивание PDF на ярлык. Стрелка «этот край первым в лоток» печатается один раз на новом листе. Интерфейс на русском и английском.
+Возможности: автоопределение и автоповорот этикетки, предпросмотр, печать 1:1 без масштабирования, калибровка со сдвигом X/Y в мм, кнопка «Последний PDF из Загрузок», перетаскивание PDF на ярлык. Ручной выбор области с предпросмотром результата и растягиванием на всю ячейку, поворот на 90° для каждой этикетки. Изображения (PNG, JPG и др.) и вставка скрина из буфера (Ctrl+V). Пакетная печать: очередь из нескольких этикеток, предпросмотр всего листа A4 и печать всех в свободные места одним заданием. Стрелка «этот край первым в лоток» печатается один раз на новом листе. Интерфейс на русском и английском.
 
 Установка: `pip install -r requirements.txt`, запуск: `pythonw label_print.py`.
 
