@@ -60,6 +60,9 @@ T = {
         "calib": "Калибровка (печать рамок)",
         "arrow_chk": "Стрелка «в лоток» на новом листе A4",
         "print": "ПЕЧАТЬ",
+        "print_all": "ПЕЧАТЬ ВСЕХ ({n}) НА ЛИСТ",
+        "batch_more": "Свободных мест: {f}, этикеток: {n}. Напечатаются первые {f}.",
+        "batch_t": "Пакетная печать",
         "language": "Язык:",
         "info": "Этикетка {w:.0f}×{h:.0f} мм, масштаб {s:.0f}%, поворот {r}°",
         "page": ", стр. {n}/{t}",
@@ -101,6 +104,9 @@ T = {
         "calib": "Calibration (print frames)",
         "arrow_chk": "“Feed edge” arrow on a new A4 sheet",
         "print": "PRINT",
+        "print_all": "PRINT ALL ({n}) ON SHEET",
+        "batch_more": "Free slots: {f}, labels: {n}. The first {f} will be printed.",
+        "batch_t": "Batch print",
         "language": "Language:",
         "info": "Label {w:.0f}×{h:.0f} mm, scale {s:.0f}%, rotation {r}°",
         "page": ", page {n}/{t}",
@@ -203,7 +209,7 @@ def text_rotation(page, clip):
     return best
 
 
-def build_page(src_page, pos, cfg, rot_override=None, lang="en"):
+def build_page(src_page, pos, cfg, rot_override=None, lang="en", out=None):
     """Returns (single-page doc of the paper size with the label in cell pos, info)."""
     mode = cfg.get("mode", "A4")
     clip = content_bbox(src_page)
@@ -216,9 +222,12 @@ def build_page(src_page, pos, cfg, rot_override=None, lang="en"):
     tw, th = w * scale, h * scale
     x0 = cx * MM + (cw * MM - tw) / 2
     y0 = cy * MM + (ch * MM - th) / 2
-    out = pymupdf.open()
     _, pw, ph = PAPER[mode]
-    pg = out.new_page(width=pw * MM, height=ph * MM)
+    if out is None:
+        out = pymupdf.open()
+        pg = out.new_page(width=pw * MM, height=ph * MM)
+    else:
+        pg = out[0]
     # rot is the text direction; show_pdf_page(rotate=rot) makes it upright
     pg.show_pdf_page(pymupdf.Rect(x0, y0, x0 + tw, y0 + th), src_page.parent, src_page.number,
                      clip=clip, rotate=rot)
@@ -326,6 +335,7 @@ class App:
         self.rot_override = None
         self.preview_img = None
         self.main = None
+        self.batch = []          # [(pymupdf doc, page_no, name)] — all labels opened
         root.resizable(False, False)
         self.build_ui()
         if initial:
@@ -406,6 +416,8 @@ class App:
         self.info = ttk.Label(side, text="", wraplength=210, justify="left")
         self.info.pack(anchor="w")
         ttk.Button(side, text=t["print"], command=self.do_print).pack(fill="x", pady=(10, 0), ipady=8)
+        self.all_btn = ttk.Button(side, command=self.print_all)
+        self.all_btn.pack(fill="x", pady=(6, 0), ipady=6)
         self.on_mode()
 
     def on_lang(self, _ev=None):
@@ -448,7 +460,13 @@ class App:
         st = "disabled" if self.cfg["mode"] == "A6" else "normal"
         for w in self.pos_btns + [self.new_btn]:
             w.config(state=st)
+        self.update_batch_btn()
         self.redraw()
+
+    def update_batch_btn(self):
+        n = len(self.batch)
+        self.all_btn.config(text=self.t["print_all"].format(n=n),
+                            state="normal" if n > 1 and self.cfg.get("mode") == "A4" else "disabled")
 
     def on_canvas_click(self, ev):
         if self.cfg.get("mode") == "A6":
@@ -460,9 +478,22 @@ class App:
 
     # --- loading
     def open_dialog(self):
-        f = filedialog.askopenfilename(initialdir=DOWNLOADS, filetypes=[("PDF", "*.pdf")])
-        if f:
-            self.load(Path(f))
+        fs = filedialog.askopenfilenames(initialdir=DOWNLOADS, filetypes=[("PDF", "*.pdf")])
+        if not fs:
+            return
+        self.load(Path(fs[0]))
+        if len(fs) > 1:
+            batch = []
+            for f in fs:
+                try:
+                    d = pymupdf.open(f)
+                except Exception as e:
+                    messagebox.showerror(self.t["error"], self.t["open_err"].format(e=e))
+                    continue
+                batch += [(d, i, Path(f).name) for i in range(len(d))]
+            self.batch = batch
+            self.file_lbl.config(text=f"{len(fs)} PDF")
+            self.update_batch_btn()
 
     def open_latest(self):
         pdfs = sorted(DOWNLOADS.glob("*.pdf"), key=lambda p: p.stat().st_mtime, reverse=True)
@@ -481,6 +512,8 @@ class App:
         self.page_no = 0
         self.rot_override = None
         self.file_lbl.config(text=path.name[:45])
+        self.batch = [(self.src, i, path.name) for i in range(len(self.src))]
+        self.update_batch_btn()
         self.redraw()
 
     # --- preview
@@ -538,6 +571,46 @@ class App:
                           self.cfg, "Calibration", paper)
         except Exception as e:
             messagebox.showerror(t["print_err"], str(e))
+
+    def print_all(self):
+        """Print every opened label into the free slots of one A4 sheet, in one job."""
+        t = self.t
+        if self.cfg.get("mode") != "A4" or not self.batch:
+            return
+        self.save_cfg()
+        free = [p for p in range(1, 5) if p not in self.state["used"]]
+        if not free:
+            self.new_sheet()
+            free = [1, 2, 3, 4]
+        if len(self.batch) > len(free):
+            messagebox.showinfo(t["batch_t"], t["batch_more"].format(f=len(free), n=len(self.batch)))
+        items = list(zip(free, self.batch))
+        try:
+            doc = pymupdf.open()
+            doc.new_page(width=A4_W * MM, height=A4_H * MM)
+            for pos, (d, pn, _) in items:
+                build_page(d[pn], pos, self.cfg, None, self.cfg["lang"], out=doc)
+            regions = [page_cell(pos, "A4") for pos, _ in items]
+            if self.arrow_due():
+                draw_feed_arrow(doc[0], self.cfg["lang"])
+                regions.append(ARROW_BOX)
+            OUT.mkdir(exist_ok=True)
+            doc.save(OUT / f"{time.strftime('%Y%m%d-%H%M%S')}-batch{len(items)}.pdf")
+            print_regions(self.cfg["printer"], doc, regions, self.cfg, "Labels batch", PAPER["A4"][0])
+        except Exception as e:
+            messagebox.showerror(t["print_err"], str(e))
+            return
+        for pos, _ in items:
+            if pos not in self.state["used"]:
+                self.state["used"].append(pos)
+        if len(self.state["used"]) >= 4:
+            self.state["used"] = []
+            messagebox.showinfo(t["sheet_done_t"], t["sheet_done"])
+        save_json(STATE, self.state)
+        self.batch = self.batch[len(items):]
+        self.update_batch_btn()
+        self.pos.set(self.next_free() or 1)
+        self.redraw()
 
     def do_print(self):
         t = self.t
